@@ -17,8 +17,7 @@
         "--allow-all",
         "main.ts",
         "add",
-        "344887",
-        "321358"
+        "--file=fdcids.csv"
       ],
       "attachSimplePort": 9229
     }

@@ -1,6 +1,5 @@
-import { cac, config, buildUrl, DB } from './deps.ts';
+import { cac, config, DB } from './deps.ts';
 
-config({ safe: false });
 const cli = cac('omhh');
 
 interface UpOptions {
@@ -11,15 +10,16 @@ interface UpOptions {
 }
 
 cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and Home database')
-    .option('--db', 'source sqlite3 database file path', { default: './food-db.sqlite3' })
+    .option('--db', 'source sqlite3 database file path', { default: './food-data.sqlite3' })
     .option('--api', 'omhh api uri')
     .option('--token', 'omhh api token')
-    .option('--file', 'file of fdc ids')
+    .option('--file <file>', 'file of fdc ids')
     .action(async (fdcIds: string[] = [], options: UpOptions) => {
         if (fdcIds[fdcIds.length - 1] === 'main.ts') {
             fdcIds.pop();
         }
 
+        config({ safe: false, export: true });
         const { OMHH_API_URI, OMHH_API_TOKEN } = Deno.env.toObject();
 
         const {
@@ -37,17 +37,22 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
 
         // for each new id, look them up in the database and construct the mutation
         const db = new DB(dbFilePath, { mode: 'read' });
-        let mutation: unknown = undefined;
+        // deno-lint-ignore camelcase
+        let fdc_id: number | undefined = undefined;
+        let description: string | undefined = undefined;
+        let source: string | undefined = undefined;
+        // deno-lint-ignore no-explicit-any
+        let mutation: { mutations: any[] } | undefined = undefined;
         try {
 
             type FdcIdQueryParam = { fdcId: string };
 
             type FoodQueryTuple = [number, string, string];
             // deno-lint-ignore camelcase
-            type FoodQueryEntry = { fdc_id: number, description: string, data_type: string };
+            type FoodQueryEntry = { fdc_id: number, description: string, source: string };
 
             const foodQuery = db.prepareQuery<FoodQueryTuple, FoodQueryEntry, FdcIdQueryParam>(`
-                select f.fdc_id, f.description, f.data_type 
+                select f.fdc_id, f.description, f.data_type as source
                 from food f where f.fdc_id = :fdcId
             `.trim());
 
@@ -77,9 +82,16 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
                 where fp.fdc_id = :fdcId
             `.trim());
 
-            const mutations = fdcIds.map(fdcId => {
-                // deno-lint-ignore camelcase
-                const { fdc_id, description, data_type: source } = foodQuery.oneEntry({ fdcId });
+            const mutations = fdcIds.map((fdcId, i) => {
+                console.log(`processing ${i + 1} of ${fdcIds.length}`);
+                try {
+                    const food: FoodQueryEntry = foodQuery.oneEntry({ fdcId });
+                    fdc_id = food.fdc_id;
+                    description = food.description;
+                    source = food.source;
+                } catch (_error) {
+                    console.error(`could not find fdc_id: ${fdcId}`);
+                }
 
                 let brand: BrandQueryEntry = {}
                 try {
@@ -90,23 +102,39 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
 
                 let nutrients: NutrientsQueryEntry[] = [];
                 try {
-                    nutrients = nutrientsQuery.allEntries({ fdcId }).map(n => ({ _key: n, ...n }));
+                    nutrients = nutrientsQuery.allEntries({ fdcId }).map(n => ({ _key: n, ...n })).sort((a, b) => {
+                        if (a.name === b.name) {
+                            return 0;
+                        } else if (a.name > b.name) {
+                            return 1;
+                        } else {
+                            return -1;
+                        }
+                    });
                 } catch (_error) {
                     // ignore
                 }
 
                 let portions: PortionsQueryEntry[] = [];
                 try {
-                    portions = portionsQuery.allEntries({ fdcId }).map(p => ({ _key: p.unit, ...p }));
+                    portions = portionsQuery.allEntries({ fdcId }).map(p => ({ _key: p.unit, ...p })).sort((a, b) => {
+                        if (a.unit === b.unit) {
+                            return 0;
+                        } else if (a.unit < b.unit) {
+                            return 1;
+                        } else {
+                            return -1;
+                        }
+                    });
                 } catch (_error) {
                     // ignore
                 }
 
                 // deno-lint-ignore camelcase
                 const { brand_owner, brand_name, subbrand_name, serving_size, serving_size_unit, household_serving_fulltext } = brand;
-                return {
+                const doc = {
                     createOrReplace: {
-                        _id: fdc_id,
+                        _id: fdcId,
                         _type: 'food',
                         description,
                         fdc_id,
@@ -121,18 +149,31 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
                         household_serving_fulltext,
                     }
                 };
+
+                fdc_id = undefined;
+                description = undefined;
+                source = undefined;
+
+                return doc;
+            }).filter(data => {
+                if (data.createOrReplace.fdc_id) {
+                    return true;
+                }
+                return false;
             });
 
             mutation = { mutations }
         } catch (error) {
             return console.error(error);
         } finally {
-            db.close(true)
+            db.close(true);
+            console.log('processing complete.');
         }
 
         // post mutation
         if (mutation) {
-            const postApi = buildUrl(apiBase, { path: ['data', 'mutate', 'production'] });
+            console.log('Uploading documents, this may take a minute...');
+            const postApi = `${apiBase[apiBase.length - 1] == '/' ? apiBase.slice(0, apiBase.length - 1) : apiBase}/data/mutate/production`;
             try {
                 const res = await fetch(
                     postApi,
@@ -146,6 +187,7 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
                     }
                 );
                 const result = await res.json();
+                console.log(`Uploaded ${mutation.mutations.length} foods`);
                 console.log(result);
             } catch (error) {
                 console.error(error);
