@@ -4,7 +4,7 @@
     {
       "type": "deno",
       "command": "run",
-      "args": ["--allow-read", "--allow-net"],
+      "args": ["--allow-env", "--allow-read", "--allow-net"],
       "problemMatcher": ["$deno"],
       "label": "deno: run"
     },
@@ -14,6 +14,18 @@
       "args": ["main.ts"],
       "problemMatcher": ["$deno"],
       "label": "deno: cache"
+    },
+    {
+      "type": "deno",
+      "command": "build",
+      "args": [
+        "--allow-read",
+        "--allow-env",
+        "--allow-net",
+        "--target=x86_64-unknown-linux-gnu",
+        "--output=build/omhh",
+        "main.ts"
+      ]
     }
   ]
 }
