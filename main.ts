@@ -2,6 +2,25 @@ import { cac, config, DB } from './deps.ts';
 
 const cli = cac('omhh');
 
+type FdcIdQueryParam = { fdcId: string };
+
+type FoodQueryTuple = [number, string, string];
+// deno-lint-ignore camelcase
+type FoodQueryEntry = { fdc_id: number, description: string, source: string };
+
+type NutrientsQueryTuple = [string, number, string];
+// deno-lint-ignore camelcase
+type NutrientsQueryEntry = { name: string, amount: number, unit_name: string };
+
+type BrandQueryTuple = [string, string, string, number, string, string];
+// deno-lint-ignore camelcase
+type BrandQueryEntry = { brand_owner?: string, brand_name?: string, subbrand_name?: string, serving_size?: number, serving_size_unit?: string, household_serving_fulltext?: string };
+
+type PortionsQueryTuple = [number, string, number, string, string];
+// deno-lint-ignore camelcase
+type PortionsQueryEntry = { amount: number, unit: string, gram_weight: number, portion_description: string, modifier: string };
+
+
 interface UpOptions {
     db: string;
     api: string;
@@ -30,9 +49,58 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
         } = options;
 
         // get a resolved list of fdc-ids to check
+        let portionMap: Record<string, PortionsQueryEntry[]> = {};
         if (file != null) {
             const text = await Deno.readTextFile(file);
-            fdcIds.push(...text.split('\n').map(id => id.trim()));
+
+            // quick and dirty parsing of csv file.  The csv is setup as:
+            //
+            // <fdc_id>,<gram_weight>,<unit>,<modifier>\n
+            //
+            // all amounts are assumed to be 1
+
+            // split the rows
+            portionMap = text.split('\n')
+                // split the columns and trim any whitespace
+                .map(rowStr => rowStr.split(',').map(v => v.trim()))
+
+                // parse the columns
+                .map(([fdc_id, gram_weight, unit, modifier]) => ({
+                    fdc_id,
+                    gram_weight: parseFloat(gram_weight),
+                    unit,
+                    modifier
+                }))
+
+                // combine portions of the same fdc_id and map the columns into a PortionsQueryEntry
+                .reduce((pMap, f) => {
+                    // deno-lint-ignore camelcase
+                    const { fdc_id, gram_weight, unit, modifier } = f;
+                    const portion: PortionsQueryEntry & { _key: string } = {
+                        _key: `1${unit}${modifier}`,
+                        amount: 1,
+                        unit,
+                        // deno-lint-ignore camelcase
+                        gram_weight,
+                        modifier,
+                        // deno-lint-ignore camelcase
+                        portion_description: ''
+                    };
+
+                    if (fdc_id in pMap) {
+                        pMap[fdc_id].push(portion);
+                    } else {
+                        pMap[fdc_id] = [portion];
+                    }
+
+                    return pMap;
+                }, portionMap);
+        }
+
+        // if a file was provided then extract the unique fdc_ids for lookup
+        const keysFromFile = Object.keys(portionMap);
+        if (keysFromFile.length > 0) {
+            fdcIds.push(...keysFromFile);
         }
 
         // for each new id, look them up in the database and construct the mutation
@@ -44,38 +112,22 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
         // deno-lint-ignore no-explicit-any
         let mutation: { mutations: any[] } | undefined = undefined;
         try {
-
-            type FdcIdQueryParam = { fdcId: string };
-
-            type FoodQueryTuple = [number, string, string];
-            // deno-lint-ignore camelcase
-            type FoodQueryEntry = { fdc_id: number, description: string, source: string };
-
             const foodQuery = db.prepareQuery<FoodQueryTuple, FoodQueryEntry, FdcIdQueryParam>(`
                 select f.fdc_id, f.description, f.data_type as source
                 from food f where f.fdc_id = :fdcId
             `.trim());
 
-            type NutrientsQueryTuple = [string, number, string];
-            // deno-lint-ignore camelcase
-            type NutrientsQueryEntry = { name: string, amount: number, unit_name: string };
             const nutrientsQuery = db.prepareQuery<NutrientsQueryTuple, NutrientsQueryEntry, FdcIdQueryParam>(`
                 select n.name, fn.amount, n.unit_name from food_nutrient fn
                 inner join nutrient n on fn.nutrient_id = n.id
                 where fn.fdc_id = :fdcId
             `.trim());
 
-            type BrandQueryTuple = [string, string, string, number, string, string];
-            // deno-lint-ignore camelcase
-            type BrandQueryEntry = { brand_owner?: string, brand_name?: string, subbrand_name?: string, serving_size?: number, serving_size_unit?: string, household_serving_fulltext?: string };
             const brandQuery = db.prepareQuery<BrandQueryTuple, BrandQueryEntry, FdcIdQueryParam>(`
                 select brand_owner, ifnull(brand_name,'') as brand_name, ifnull(subbrand_name,'') as subbrand_name, ifnull(serving_size,0) as serving_size, ifnull(serving_size_unit,'') as serving_size_unit, ifnull(household_serving_fulltext,'') as household_serving_fulltext from branded_food
                 where fdc_id = :fdcId
             `.trim());
 
-            type PortionsQueryTuple = [number, string, number, string, string];
-            // deno-lint-ignore camelcase
-            type PortionsQueryEntry = { amount: number, unit: string, gram_weight: number, portion_description: string, modifier: string };
             const portionsQuery = db.prepareQuery<PortionsQueryTuple, PortionsQueryEntry, FdcIdQueryParam>(`
                 select fp.amount, m.name as unit, fp.gram_weight, ifnull(fp.portion_description,'') as portion_description, ifnull(fp.modifier,'') as modifier from food_portion fp
                 inner join measure_unit m on fp.measure_unit_id = m.id
@@ -100,9 +152,9 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
                     // ignore
                 }
 
-                let nutrients: NutrientsQueryEntry[] = [];
+                const nutrients: NutrientsQueryEntry[] = [];
                 try {
-                    nutrients = nutrientsQuery.allEntries({ fdcId }).map(n => ({ _key: n, ...n })).sort((a, b) => {
+                    nutrients.push(...nutrientsQuery.allEntries({ fdcId }).map(n => ({ _key: n, ...n })).sort((a, b) => {
                         if (a.name === b.name) {
                             return 0;
                         } else if (a.name > b.name) {
@@ -110,14 +162,17 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
                         } else {
                             return -1;
                         }
-                    });
+                    }));
                 } catch (_error) {
                     // ignore
                 }
 
-                let portions: PortionsQueryEntry[] = [];
+                const portions: PortionsQueryEntry[] = [];
+                if (fdcId in portionMap) {
+                    portions.push(...portionMap[fdcId]);
+                }
                 try {
-                    portions = portionsQuery.allEntries({ fdcId }).map(p => ({ _key: p.unit, ...p })).sort((a, b) => {
+                    portions.push(...portionsQuery.allEntries({ fdcId }).map(p => ({ _key: `${p.amount}${p.unit}${p.modifier}`, ...p })).sort((a, b) => {
                         if (a.unit === b.unit) {
                             return 0;
                         } else if (a.unit < b.unit) {
@@ -125,7 +180,7 @@ cli.command('add [...fdcIds]>', 'adds (or overwrites) foods to Oh My Heart and H
                         } else {
                             return -1;
                         }
-                    });
+                    }));
                 } catch (_error) {
                     // ignore
                 }
